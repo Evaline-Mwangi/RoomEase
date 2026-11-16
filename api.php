@@ -334,20 +334,72 @@ try {
         exit;
     }
 
-    if ($resource === 'payment' && $method === 'PATCH') {
-        $id = filter_input(INPUT_GET, 'id', FILTER_VALIDATE_INT);
-        $input = json_decode(file_get_contents('php://input'), true) ?? [];
-        $status = ($input['outcome'] ?? '') === 'success' ? 'success' : 'failed';
-        $receipt = $status === 'success' ? 'DEMO' . strtoupper(bin2hex(random_bytes(4))) : null;
-        $stmt = $pdo->prepare('UPDATE payments SET status=:status, mpesa_receipt_no=:receipt, paid_at=:paid_at WHERE payment_id=:id');
-        $stmt->execute(['status' => $status, 'receipt' => $receipt, 'paid_at' => $status === 'success' ? date('Y-m-d H:i:s') : null, 'id' => $id ?: 0]);
-        $stmt = $pdo->prepare('SELECT payment_id, booking_id, phone_number, amount, mpesa_receipt_no, status, paid_at FROM payments WHERE payment_id=:id');
-        $stmt->execute(['id' => $id ?: 0]);
-        $payment = $stmt->fetch();
-        if (!$payment) { http_response_code(404); echo json_encode(['message' => 'Payment not found.']); exit; }
-        echo json_encode($payment);
+   
+if ($resource === 'payment' && $method === 'PATCH') {
+    $id = filter_input(INPUT_GET, 'id', FILTER_VALIDATE_INT);
+    $input = json_decode(file_get_contents('php://input'), true) ?? [];
+
+    if (!$id) {
+        http_response_code(400);
+        echo json_encode(['message' => 'Invalid payment ID.']);
         exit;
     }
+
+    $outcome = $input['outcome'] ?? '';
+
+    if (!in_array($outcome, ['success', 'failed'], true)) {
+        http_response_code(400);
+        echo json_encode(['message' => 'Invalid payment outcome.']);
+        exit;
+    }
+
+    $status = $outcome;
+    $receipt = null;
+
+    if ($status === 'success') {
+        $receipt = trim($input['mpesa_receipt_no'] ?? '');
+
+        if ($receipt === '') {
+            http_response_code(400);
+            echo json_encode(['message' => 'M-Pesa receipt number is required.']);
+            exit;
+        }
+    }
+
+    $stmt = $pdo->prepare(
+        'UPDATE payments
+         SET status = :status,
+             mpesa_receipt_no = :receipt,
+             paid_at = :paid_at
+         WHERE payment_id = :id'
+    );
+
+    $stmt->execute([
+        'status' => $status,
+        'receipt' => $receipt,
+        'paid_at' => $status === 'success' ? date('Y-m-d H:i:s') : null,
+        'id' => $id
+    ]);
+
+    $stmt = $pdo->prepare(
+        'SELECT payment_id, booking_id, phone_number, amount,
+                mpesa_receipt_no, status, paid_at
+         FROM payments WHERE payment_id = :id'
+    );
+
+    $stmt->execute(['id' => $id]);
+    $payment = $stmt->fetch();
+
+    if (!$payment) {
+        http_response_code(404);
+        echo json_encode(['message' => 'Payment not found.']);
+        exit;
+    }
+
+    echo json_encode($payment);
+    exit;
+}
+
 
     http_response_code(404);
     echo json_encode(['message' => 'Unknown API resource.']);

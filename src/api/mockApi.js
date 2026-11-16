@@ -7,8 +7,12 @@
 // ---------------------------------------------------------------------------
 import { buildSeed } from '../data/seed';
 import { addDays, nightsBetween, overlaps, today } from '../lib/format';
+import { ADMIN_ACCESS_CODE } from '../config';
 
-const KEY = 'roomease_db_v1';
+// v2: the demo accounts/bookings of v1 are gone, so old browsers start fresh.
+const KEY = 'roomease_db_v2';
+// Where the Daraja payment server lives. Empty = same origin (Vite proxies /api to it in development).
+const API = import.meta.env.VITE_API_URL || '';
 const SESSION = 'roomease_session';
 let cache = null;
 
@@ -30,7 +34,16 @@ function save() {
   try { localStorage.setItem(KEY, JSON.stringify(cache)); } catch { /* ignore */ }
 }
 const nextId = (table, key) => Math.max(0, ...db()[table].map((x) => x[key])) + 1;
-const safeUser = ({ password, ...u }) => u; // never send passwords to the UI
+const safeUser = ({ password_hash, salt, ...u }) => u; // never send password data to the UI
+
+// Passwords are salted + hashed (SHA-256) before being stored, so they are not kept as plain text.
+// MOCK ONLY: the real backend must use bcrypt or argon2 (NFR2).
+async function hashPassword(password, salt) {
+  if (!globalThis.crypto?.subtle) return 'plain:' + password; // insecure context (http on a LAN address)
+  const bytes = new TextEncoder().encode(`${salt}:${password}`);
+  const digest = await crypto.subtle.digest('SHA-256', bytes);
+  return Array.from(new Uint8Array(digest)).map((b) => b.toString(16).padStart(2, '0')).join('');
+}
 const fail = (message) => { throw new Error(message); };
 
 async function backendGet(params) {
@@ -95,22 +108,26 @@ export async function login(identifier, password) {
   const u = db().users.find(
     (x) => (x.email && x.email.toLowerCase() === id) || (x.phone && (x.phone === digits || '0' + x.phone.slice(3) === digits)),
   );
-  if (!u || u.password !== password) fail('Incorrect email/phone or password.');
+  if (!u || (await hashPassword(password, u.salt)) !== u.password_hash) fail('Incorrect email/phone or password.');
   try { localStorage.setItem(SESSION, String(u.user_id)); } catch { /* ignore */ }
   return safeUser(u);
 }
 
-// POST /api/auth/register   { full_name, email?, phone?, password }
-export async function register({ full_name, email, phone, password }) {
+// POST /api/auth/register   { full_name, email?, phone?, password, role: 'student' | 'admin', admin_code? }
+export async function register({ full_name, email, phone, password, role = 'student', admin_code }) {
   await delay();
   if (!email && !phone) fail('Provide an email or a phone number.');
+  if (!['student', 'admin'].includes(role)) fail('Invalid account type.');
+  if (role === 'admin' && admin_code !== ADMIN_ACCESS_CODE) fail('Invalid admin access code.');
   if (email && db().users.some((u) => u.email?.toLowerCase() === email.toLowerCase())) fail('That email is already registered.');
   if (phone && db().users.some((u) => u.phone === phone)) fail('That phone number is already registered.');
+  const salt = Math.random().toString(36).slice(2);
   const u = {
     user_id: nextId('users', 'user_id'), full_name, email: email || null, phone: phone || null,
-    password, role: 'student', created_at: today(),
+    password_hash: await hashPassword(password, salt), salt, role, created_at: today(),
   };
   db().users.push(u);
+  if (role === 'admin') audit(u.user_id, 'Registered admin account', 'user', u.user_id);
   save();
   try { localStorage.setItem(SESSION, String(u.user_id)); } catch { /* ignore */ }
   return safeUser(u);
@@ -165,16 +182,113 @@ export async function cancelMyBooking(booking_id, user_id) {
   return backendWrite('PATCH', { resource: 'my-booking', id: String(booking_id), user_id: String(user_id) }, {});
 }
 
-// POST /api/payments/mpesa/stk-push   { booking_id, phone }   → Daraja STK Push
-export async function startPayment(booking_id, phone_number) {
-  return backendWrite('POST', { resource: 'payment' }, { booking_id, phone_number });
+// Talks to our own Daraja server (server/index.js). The Safaricom keys live ONLY on that server.
+async function callPaymentServer(path, body) {
+  let res;
+  try {
+    res = await fetch(API + path, {
+      method: body ? 'POST' : 'GET',
+      headers: body ? { 'Content-Type': 'application/json' } : undefined,
+      body: body ? JSON.stringify(body) : undefined,
+    });
+  } catch {
+    fail('Cannot reach the payment server. Start it with "npm run server" (or "npm run dev:all") and try again.');
+  }
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    // Our server always answers errors with a JSON "message". A 5xx without one means the dev proxy
+    // could not reach the server at all (it is switched off).
+    if (!data.message && res.status >= 500) fail('Cannot reach the payment server. Start it with "npm run server" (or "npm run dev:all") and try again.');
+    fail(data.message || 'The payment request failed. Please try again.');
+  }
+  return data;
 }
 
-// The real flow is: Safaricom calls YOUR callback URL with the result and the UI polls
-// GET /api/payments/:id until status != 'pending'.  Here we just resolve it directly.
-export async function completePayment(payment_id, outcome) {
-  return backendWrite('PATCH', { resource: 'payment', id: String(payment_id) }, { outcome });
+// POST /api/mpesa/stkpush   { phone, amount, reference }   → Daraja M-Pesa Express (STK Push)
+
+// Keep the checkout request ID while the checkout page is polling.
+const paymentCheckouts = new Map();
+
+// POST: Create a MySQL payment record, then send the M-Pesa STK Push.
+export async function startPayment(booking_id, phone_number) {
+  const payment = await backendWrite(
+    'POST',
+    { resource: 'payment' },
+    { booking_id, phone_number }
+  );
+
+  try {
+    const res = await callPaymentServer('/api/mpesa/stkpush', {
+      phone: phone_number,
+      amount: Number(payment.amount),
+      reference: `ROOM${booking_id}`,
+    });
+
+    paymentCheckouts.set(payment.payment_id, res.checkoutRequestId);
+
+    return {
+      ...payment,
+      checkout_request_id: res.checkoutRequestId,
+      customerMessage: res.customerMessage,
+    };
+  } catch (error) {
+    await backendWrite(
+      'PATCH',
+      { resource: 'payment', id: String(payment.payment_id) },
+      { outcome: 'failed' }
+    );
+    throw error;
+  }
 }
+
+// GET: Check the actual M-Pesa payment status.
+export async function checkPayment(payment_id) {
+  const checkoutRequestId = paymentCheckouts.get(payment_id);
+
+  if (!checkoutRequestId) {
+    fail('Payment session not found. Please start the payment again.');
+  }
+
+  const result = await callPaymentServer(
+    `/api/mpesa/status/${checkoutRequestId}`
+  );
+
+  if (result.status === 'pending') {
+    return { payment_id, status: 'pending' };
+  }
+
+  const payment = await backendWrite(
+    'PATCH',
+    { resource: 'payment', id: String(payment_id) },
+    {
+      outcome: result.status,
+      mpesa_receipt_no: result.receipt || null,
+    }
+  );
+
+  paymentCheckouts.delete(payment_id);
+
+  return {
+    ...payment,
+    message: result.message,
+  };
+}
+
+// Handle the student's decision to stop waiting.
+export async function cancelPayment(payment_id) {
+  const checkoutRequestId = paymentCheckouts.get(payment_id);
+
+  if (checkoutRequestId) {
+    paymentCheckouts.delete(payment_id);
+  }
+
+  return backendWrite(
+    'PATCH',
+    { resource: 'payment', id: String(payment_id) },
+    { outcome: 'failed' }
+  );
+}
+
 
 /* ---------------------------- ADMIN (FR4, FR5) ---------------------------- */
 
@@ -226,38 +340,52 @@ export async function adminStats() {
   };
 }
 
-// GET /api/admin/reports/occupancy?from=&to=
-export async function adminOccupancyReport(from, to) {
-  await delay(400);
+// GET /api/admin/reports/rooms/:roomId?from=&to=      (one room at a time)
+export async function adminRoomReport(room_id, from, to) {
+  await delay(300);
+  const room = db().rooms.find((r) => r.room_id === Number(room_id));
+  if (!room) fail('Please choose a room.');
   const days = nightsBetween(from, to);
   if (days < 1) fail('The end date must be after the start date.');
-  const rows = db().rooms.filter((r) => r.status === 'active').map((room) => {
-    let nights = 0;
-    db().bookings
-      .filter((b) => b.room_id === room.room_id && b.status === 'approved' && overlaps(b.check_in, b.check_out, from, to))
-      .forEach((b) => {
-        const s = b.check_in > from ? b.check_in : from;
-        const e = b.check_out < to ? b.check_out : to;
-        nights += nightsBetween(s, e);
-      });
-    const t = withType(room);
-    return {
-      room_number: room.room_number, type_name: t.type_name, nights, days,
-      occupancy: Math.round((nights / days) * 100),
-      revenue: nights * room.price_per_night,
-    };
-  });
-  const totalNights = rows.reduce((s, r) => s + r.nights, 0);
+
+  const bookings = db().bookings
+    .filter((b) => b.room_id === room.room_id && overlaps(b.check_in, b.check_out, from, to))
+    .map((b) => {
+      const h = hydrateBooking(b);
+      const s = b.check_in > from ? b.check_in : from;
+      const e = b.check_out < to ? b.check_out : to;
+      const nights = nightsBetween(s, e);
+      return {
+        booking_id: b.booking_id,
+        student: h.student.full_name,
+        contact: h.student.email || (h.student.phone ? '+' + h.student.phone : ''),
+        check_in: b.check_in, check_out: b.check_out,
+        nights_in_range: nights,
+        status: b.status,
+        payment: h.payment ? (h.payment.status === 'success' ? 'paid' : h.payment.status) : 'unpaid',
+        receipt: h.payment?.mpesa_receipt_no || '',
+        total_amount: b.total_amount,
+        revenue_in_range: nights * room.price_per_night,
+      };
+    })
+    .sort((a, z) => a.check_in.localeCompare(z.check_in));
+
+  const approved = bookings.filter((b) => b.status === 'approved');
+  const nights = approved.reduce((sum, b) => sum + b.nights_in_range, 0);
   return {
-    from, to, days, rows,
-    overall: rows.length ? Math.round((totalNights / (rows.length * days)) * 100) : 0,
-    revenue: rows.reduce((s, r) => s + r.revenue, 0),
-    totalNights,
+    room: withType(room), from, to, days, bookings, nights,
+    occupancy: Math.round((nights / days) * 100),
+    revenue: approved.reduce((sum, b) => sum + b.revenue_in_range, 0),
+    counts: {
+      approved: approved.length,
+      pending: bookings.filter((b) => b.status === 'pending').length,
+      cancelled: bookings.filter((b) => b.status === 'cancelled').length,
+    },
   };
 }
 
 export function defaultReportRange() {
-  return { from: addDays(today(), -30), to: today() };
+  return { from: addDays(today(), -30), to: addDays(today(), 30) };
 }
 
 // Handy while developing: wipe localStorage back to the demo data
