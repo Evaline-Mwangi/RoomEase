@@ -39,6 +39,120 @@ try {
     $pdo = db();
     $resource = $_GET['resource'] ?? '';
     $method = $_SERVER['REQUEST_METHOD'] ?? 'GET';
+    
+
+// USER LOGIN
+if ($resource === 'auth-login' && $method === 'POST') {
+    $input = json_decode(file_get_contents('php://input'), true) ?? [];
+
+    $identifier = strtolower(trim($input['identifier'] ?? ''));
+    $password = $input['password'] ?? '';
+
+    if ($identifier === '' || $password === '') {
+        http_response_code(400);
+        echo json_encode(['message' => 'Enter your email or phone and password.']);
+        exit;
+    }
+
+    $stmt = $pdo->prepare(
+        'SELECT user_id, full_name, email, phone, password_hash, role
+         FROM users
+         WHERE LOWER(email) = :email OR phone = :phone
+         LIMIT 1'
+    );
+
+    $stmt->execute([
+        'email' => $identifier,
+        'phone' => $identifier
+    ]);
+
+    $user = $stmt->fetch();
+
+    if (!$user || !password_verify($password, $user['password_hash'])) {
+        http_response_code(401);
+        echo json_encode(['message' => 'Invalid email/phone or password.']);
+        exit;
+    }
+
+    unset($user['password_hash']);
+
+    echo json_encode($user);
+    exit;
+}
+
+
+// STUDENT AND ADMIN REGISTRATION
+if ($resource === 'auth-register' && $method === 'POST') {
+    require_once __DIR__ . '/private_config.php';
+
+    $input = json_decode(file_get_contents('php://input'), true) ?? [];
+
+    $fullName = trim($input['full_name'] ?? '');
+    $email = strtolower(trim($input['email'] ?? ''));
+    $phone = trim($input['phone'] ?? '');
+    $password = $input['password'] ?? '';
+    $role = $input['role'] ?? 'student';
+    $adminCode = $input['admin_code'] ?? '';
+
+    if (!in_array($role, ['student', 'admin'], true)) {
+        http_response_code(400);
+        echo json_encode(['message' => 'Invalid account role.']);
+        exit;
+    }
+
+    if ($role === 'admin' && !hash_equals(ADMIN_ACCESS_CODE, $adminCode)) {
+        http_response_code(403);
+        echo json_encode(['message' => 'Invalid admin access code.']);
+        exit;
+    }
+
+    if (strlen($fullName) < 2 || (!$email && !$phone) || strlen($password) < 8) {
+        http_response_code(400);
+        echo json_encode(['message' => 'Enter a valid name, email or phone, and password of at least 8 characters.']);
+        exit;
+    }
+
+    if ($email !== '' && !filter_var($email, FILTER_VALIDATE_EMAIL)) {
+        http_response_code(400);
+        echo json_encode(['message' => 'Enter a valid email address.']);
+        exit;
+    }
+
+    try {
+        $stmt = $pdo->prepare(
+            'INSERT INTO users (full_name, email, phone, password_hash, role)
+             VALUES (:name, :email, :phone, :password, :role)'
+        );
+
+        $stmt->execute([
+            'name' => $fullName,
+            'email' => $email ?: null,
+            'phone' => $phone ?: null,
+            'password' => password_hash($password, PASSWORD_DEFAULT),
+            'role' => $role
+        ]);
+    } catch (PDOException $e) {
+        if (($e->errorInfo[1] ?? null) === 1062) {
+            http_response_code(409);
+            echo json_encode(['message' => 'That email or phone number is already registered.']);
+            exit;
+        }
+        throw $e;
+    }
+
+    $userId = (int) $pdo->lastInsertId();
+
+    echo json_encode([
+        'user_id' => $userId,
+        'full_name' => $fullName,
+        'email' => $email ?: null,
+        'phone' => $phone ?: null,
+        'role' => $role
+    ]);
+    exit;
+}
+
+
 
     if ($resource === 'room-types') {
         $rows = $pdo->query('SELECT type_id, type_name, description FROM room_types ORDER BY type_id')->fetchAll();

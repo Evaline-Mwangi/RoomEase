@@ -7,7 +7,7 @@
 // ---------------------------------------------------------------------------
 import { buildSeed } from '../data/seed';
 import { addDays, nightsBetween, overlaps, today } from '../lib/format';
-import { ADMIN_ACCESS_CODE } from '../config';
+//import { ADMIN_ACCESS_CODE } from '../config';
 
 // v2: the demo accounts/bookings of v1 are gone, so old browsers start fresh.
 const KEY = 'roomease_db_v2';
@@ -92,46 +92,84 @@ const hydrateBooking = (b) => ({
 /* ------------------------------ AUTH (FR1) ------------------------------ */
 
 // GET session
+
+
 export function getSession() {
   try {
-    const id = Number(localStorage.getItem(SESSION));
-    const u = db().users.find((x) => x.user_id === id);
-    return u ? safeUser(u) : null;
-  } catch { return null; }
+    const savedUser = localStorage.getItem(SESSION);
+
+    if (!savedUser) return null;
+
+    const user = JSON.parse(savedUser);
+
+    if (
+      !user ||
+      typeof user !== 'object' ||
+      !user.full_name ||
+      !user.user_id
+    ) {
+      localStorage.removeItem(SESSION);
+      return null;
+    }
+
+    return user;
+  } catch {
+    localStorage.removeItem(SESSION);
+    return null;
+  }
 }
 
-// POST /api/auth/login   { identifier (email or phone), password }
-export async function login(identifier, password) {
-  await delay();
-  const id = identifier.trim().toLowerCase();
-  const digits = id.replace(/[\s+\-]/g, '');
-  const u = db().users.find(
-    (x) => (x.email && x.email.toLowerCase() === id) || (x.phone && (x.phone === digits || '0' + x.phone.slice(3) === digits)),
-  );
-  if (!u || (await hashPassword(password, u.salt)) !== u.password_hash) fail('Incorrect email/phone or password.');
-  try { localStorage.setItem(SESSION, String(u.user_id)); } catch { /* ignore */ }
-  return safeUser(u);
-}
+
 
 // POST /api/auth/register   { full_name, email?, phone?, password, role: 'student' | 'admin', admin_code? }
-export async function register({ full_name, email, phone, password, role = 'student', admin_code }) {
-  await delay();
-  if (!email && !phone) fail('Provide an email or a phone number.');
-  if (!['student', 'admin'].includes(role)) fail('Invalid account type.');
-  if (role === 'admin' && admin_code !== ADMIN_ACCESS_CODE) fail('Invalid admin access code.');
-  if (email && db().users.some((u) => u.email?.toLowerCase() === email.toLowerCase())) fail('That email is already registered.');
-  if (phone && db().users.some((u) => u.phone === phone)) fail('That phone number is already registered.');
-  const salt = Math.random().toString(36).slice(2);
-  const u = {
-    user_id: nextId('users', 'user_id'), full_name, email: email || null, phone: phone || null,
-    password_hash: await hashPassword(password, salt), salt, role, created_at: today(),
-  };
-  db().users.push(u);
-  if (role === 'admin') audit(u.user_id, 'Registered admin account', 'user', u.user_id);
-  save();
-  try { localStorage.setItem(SESSION, String(u.user_id)); } catch { /* ignore */ }
-  return safeUser(u);
+
+export async function login(identifier, password) {
+  const user = await backendWrite('POST', {
+    resource: 'auth-login',
+  }, {
+    identifier,
+    password,
+  });
+
+  try {
+    localStorage.setItem(SESSION, JSON.stringify(user));
+  } catch {
+    // Ignore storage errors
+  }
+
+  return user;
 }
+
+
+
+export async function register({
+  full_name,
+  email,
+  phone,
+  password,
+  role = 'student',
+  admin_code = '',
+}) {
+  const user = await backendWrite('POST', {
+    resource: 'auth-register',
+  }, {
+    full_name,
+    email,
+    phone,
+    password,
+    role,
+    admin_code,
+  });
+
+  try {
+    localStorage.setItem(SESSION, JSON.stringify(user));
+  } catch {
+    // Ignore storage errors
+  }
+
+  return user;
+}
+
 
 export function logout() {
   try { localStorage.removeItem(SESSION); } catch { /* ignore */ }
